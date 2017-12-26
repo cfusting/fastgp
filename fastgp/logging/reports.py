@@ -97,7 +97,7 @@ def add_age_to_stats(mstats):
     return mstats
 
 
-def save_log_to_csv(pop, log, file_name):
+def save_log_to_csv(log, file_path):
     columns = [log.select("cpu_time")]
     columns_names = ["cpu_time"]
     for chapter_name, chapter in log.chapters.items():
@@ -106,7 +106,7 @@ def save_log_to_csv(pop, log, file_name):
             columns.append(chapter.select(column))
 
     rows = zip(*columns)
-    with open(file_name, 'w') as f:
+    with open(file_path + '.csv', 'w') as f:
         writer = csv.writer(f)
         writer.writerow(columns_names)
         for row in rows:
