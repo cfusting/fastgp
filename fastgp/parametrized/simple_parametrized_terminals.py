@@ -1,4 +1,6 @@
 import random
+import time
+import itertools
 from functools import partial
 import math
 import re
@@ -177,20 +179,29 @@ class RangeOperationTerminal(SimpleParametrizedTerminal):
         if value < 0:
             amount *= -1
         if mutation == 'low':
-            self.begin_range += amount
-            if self.begin_range < self.lower_bound:
+            location = amount + self.begin_range
+            if location < self.lower_bound:
                 self.begin_range = self.lower_bound
-            elif self.begin_range >= self.end_range:
+            elif location > self.end_range - 2:
                 self.begin_range = self.end_range - 2
-        else:
-            self.end_range += amount
-            if self.end_range >= self.upper_bound:
+            elif location > self.upper_bound - 2:
+                self.begin_range = self.upper_bound - 2
+            else:
+                self.begin_range = location
+        elif mutation == 'high':
+            location = amount + self.end_range
+            if location > self.upper_bound:
                 self.end_range = self.upper_bound
-            elif self.end_range <= self.begin_range:
+            elif location < self.begin_range + 2:
                 self.end_range = self.begin_range + 2
+            elif location < self.lower_bound + 2:
+                self.end_range = self.lower_bound + 2
+            else:
+                self.end_range = location
 
     def create_input_vector(self, predictors):
-        return self.operation(predictors[:, self.begin_range:self.end_range], axis=1)
+        array = predictors[:, self.begin_range:self.end_range]
+        return self.operation(array, axis=1)
 
     def format(self):
         return "RangeOperation_{}_{}_{}".format(self.operation.__name__, self.names[self.begin_range],
@@ -212,14 +223,69 @@ class MomentFindingTerminal(RangeOperationTerminal):
                               end_range_name=None, *args):
         if operation is None:
             super(MomentFindingTerminal, self).initialize_parameters(variable_type_indices, names)
-            self.operation = random.choice(self.operations.values())
+            self.operation = random.choice(list(self.operations.values()))
         else:
             super(MomentFindingTerminal, self).initialize_parameters(variable_type_indices, names, operation,
                                                                      begin_range_name, end_range_name, *args)
 
     def format(self):
         return "MomentOperation_{}_{}_{}".format(self.operation.__name__, self.names[self.begin_range],
-                                                 self.names[self.end_range])
+                                                 self.names[self.end_range - 1])
+
+
+class PolynomialFindingTerminal(RangeOperationTerminal):
+    NAME = 'PolynomialOperation'
+
+    def __init__(self):
+        super(PolynomialFindingTerminal, self).__init__()
+        self.operations = {
+            'first': self.first,
+            'second': self.second,
+            'third': self.third
+        }
+
+    def first(self, X, axis=1):
+        return self.polynomial(X, 1)
+
+    def second(self, X, axis=1):
+        return self.polynomial(X, 2)
+
+    def third(self, X, axis=1):
+        return self.polynomial(X, 3)
+
+    def polynomial(self, X, order, interactions=False):
+        start = time.time()
+        orders = []
+        for o in range(1, order + 1):
+            orders.append(np.apply_along_axis(lambda x: np.power(x, o), 1, X))
+        matrix = np.concatenate(orders, axis=1)
+        rows = matrix.shape[0]
+        cols = matrix.shape[1]
+        result = np.zeros(rows)
+        if interactions:
+            indices = [x for x in range(cols)]
+            for c in range(1, cols):
+                for comb in itertools.combinations(indices, c):
+                    M = np.ones(rows)
+                    for j in comb:
+                        M *= matrix[:, j].reshape(rows)
+                    result += M
+        else:
+            result = np.sum(matrix, axis=1)
+        return result
+
+    def initialize_parameters(self, variable_type_indices, names, operation=None, begin_range_name=None,
+                              end_range_name=None, *args):
+        if operation is None:
+            super(PolynomialFindingTerminal, self).initialize_parameters(variable_type_indices, names)
+            self.operation = random.choice(list(self.operations.values()))
+        else:
+            super(PolynomialFindingTerminal, self).initialize_parameters(variable_type_indices, names, operation,
+                                                                         begin_range_name, end_range_name, *args)
+
+    def format(self):
+        return "PolynomialOperation{}_{}_{}".format(self.operation.__name__, self.names[self.begin_range],
+                                                    self.names[self.end_range - 1])
 
 
 def named_moment(number):
