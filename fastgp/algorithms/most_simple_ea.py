@@ -8,8 +8,6 @@ from deap import tools
 def generate_next_population(individuals, toolbox):
     """
     Perform truncated selection with elitism.
-    See Algorithm 1 from the arXiv preprint arXiv:1712.06567.
-    The only difference being that mutation is not defined.
     :param individuals:
     :param toolbox:
     :return:
@@ -64,7 +62,6 @@ def optimize(population, toolbox, ngen, archive=None, stats=None, verbose=False,
         history.update(population)
     logbook = tools.Logbook()
     logbook.header = ['gen', 'nevals', 'cpu_time'] + (stats.fields if stats else [])
-
     render_fitness(population, toolbox, history)
     record_information(population, stats, start, archive, logbook, verbose)
     for gen in range(1, ngen + 1):
