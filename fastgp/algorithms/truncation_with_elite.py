@@ -20,7 +20,7 @@ def generate_next_population(individuals, toolbox):
     num_top = math.floor(pop_size / 2)
     parents = individuals[0:num_top + 1]
     for _ in range(pop_size - 1):
-        off = random.choice(parents)
+        off = toolbox.clone(random.choice(parents))
         off = toolbox.mutate(off)[0]
         offspring.append(off)
     offspring.append(individuals[0])
