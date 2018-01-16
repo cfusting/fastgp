@@ -201,7 +201,10 @@ class RangeOperationTerminal(SimpleParametrizedTerminal):
 
     def create_input_vector(self, predictors):
         array = predictors[:, self.begin_range:self.end_range]
-        return self.operation(array, axis=1)
+        if array.shape[1] == 0:
+            return np.zeros((array.shape[0], 1))
+        else:
+            return self.operation(array, axis=1)
 
     def format(self):
         return "RangeOperation_{}_{}_{}".format(self.operation.__name__, self.names[self.begin_range],
@@ -411,7 +414,8 @@ def get_node_semantics(node, subtree_semantics, predictors, context):
         vector = get_terminal_semantics(node, context, predictors)
     else:
         with np.errstate(over='ignore', divide='ignore', invalid='ignore'):
-            vector = context[node.name](*list(map(lambda x: x.astype(float), subtree_semantics)))
+            vector = context[node.name](*list(map(lambda x: x.astype(float) if type(x) != float else x,
+                                                  subtree_semantics)))
     return vector
 
 

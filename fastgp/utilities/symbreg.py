@@ -70,12 +70,13 @@ def numpy_protected_div_one(left, right):
 
 
 def numpy_protected_sqrt(x):
-            x = numpy.sqrt(x)
-            if isinstance(x, numpy.ndarray):
-                x[numpy.isnan(x)] = 0
-            elif numpy.isnan(x):
-                x = 0
-            return x
+    with numpy.errstate(invalid='ignore'):
+        x = numpy.sqrt(x)
+        if isinstance(x, numpy.ndarray):
+            x[numpy.isnan(x)] = 0
+        elif numpy.isnan(x):
+            x = 0
+        return x
 
 
 def protected_log_one(x):
