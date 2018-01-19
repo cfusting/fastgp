@@ -1,9 +1,14 @@
 import random
+from copy import deepcopy
 import math
 
 import numpy as np
 
 from sklearn.linear_model import ElasticNetCV
+from sklearn.model_selection import TimeSeriesSplit, KFold
+
+from scipy.stats import pearsonr
+from scipy.stats import skew
 
 from fastgp.utilities.metrics import mean_squared_error
 from fastgp.utilities.symbreg import numpy_protected_div_dividend, numpy_protected_sqrt, numpy_protected_log_one
@@ -34,12 +39,13 @@ class Statistics:
 
 class Feature:
 
-    def __init__(self, value, string, infix_string, size=0, fitness=1):
+    def __init__(self, value, string, infix_string, size=0, fitness=1, original_variable=False):
         self.value = value
         self.fitness = fitness
         self.string = string
         self.infix_string = infix_string
         self.size = size
+        self.original_variable = original_variable
 
     def __str__(self):
         return self.string
@@ -91,16 +97,18 @@ def generate_operator_map(ops):
 
 
 operators = [
-    Operator(np.add, 2, '({0} + {1})', '(add({0},{1}))', 'add'),
-    Operator(np.subtract, 2, '({0} - {1})', '(sub({0},{1}))', 'sub'),
-    Operator(np.multiply, 2, '({0} * {1})', '(mul({0},{1}))', 'mul'),
-    Operator(numpy_protected_div_dividend, 2, '{0} / {1}', '(div({0},{1}))', 'div'),
+    Operator(np.add, 2, '({0} + {1})', 'add({0},{1})', 'add'),
+    Operator(np.subtract, 2, '({0} - {1})', 'sub({0},{1})', 'sub'),
+    Operator(np.multiply, 2, '({0} * {1})', 'mul({0},{1})', 'mul'),
+    Operator(numpy_protected_div_dividend, 2, '({0} / {1})', 'div({0},{1})', 'div'),
     # Operator(numpy_safe_exp, 1, 'exp({0})'),
     Operator(numpy_protected_log_one, 1, 'log({0})', 'log({0})', 'log'),
     Operator(square, 1, 'sqr({0})', 'sqr({0})', 'sqr'),
     Operator(numpy_protected_sqrt, 1, 'sqt({0})', 'sqt({0})', 'sqt'),
     Operator(cube, 1, 'cbe({0})', 'cbe({0})', 'cbe'),
-    Operator(np.cbrt, 1, 'cbt({0})', 'cbt({0})', 'cbt')
+    Operator(np.cbrt, 1, 'cbt({0})', 'cbt({0})', 'cbt'),
+    Operator(None, None, None, None, 'mutate'),
+    Operator(None, None, None, None, 'transition')
 
 ]
 operators_map = generate_operator_map(operators)
@@ -116,10 +124,12 @@ def init(num_additions, feature_names, predictors, seed):
     return num_additions, feature_names
 
 
-def init_features(feature_names, predictors):
+def init_features(feature_names, predictors, preserve_originals, range_operations, variable_type_indices):
     features = []
     for i, name in enumerate(feature_names):
-        features.append(Feature(predictors[:, i], name))
+        features.append(Feature(predictors[:, i], name, name, original_variable=preserve_originals))
+    for _ in range(range_operations):
+        features.append(RangeOperation(variable_type_indices, feature_names, predictors))
     return features
 
 
@@ -128,17 +138,18 @@ def get_basis(features):
     for i, f in enumerate(features):
         basis[:, i] = features[i].value
     basis = np.nan_to_num(basis)
-    if np.any(np.isnan(basis)):
-        print('Warning: NaN values detected.')
-    if not np.all(np.isfinite(basis)):
-        print('Warning: Non-finite values detected.')
     return basis
 
 
-def get_model(basis, response):
-    model = ElasticNetCV(normalize=True)
+def get_model(basis, response, time_series_cv):
+    if time_series_cv:
+        cv = TimeSeriesSplit(n_splits=3)
+    else:
+        cv = KFold(n_splits=3)
+    model = ElasticNetCV(l1_ratio=1, normalize=True, selection='random', cv=cv)
     model.fit(basis, response)
-    return model
+    _, coefs, _ = model.path(basis, response, l1_ration=model.l1_ratio_, alphas=model.alphas_)
+    return model, coefs, model.mse_path_
 
 
 def tournament_selection(population, probability):
@@ -158,41 +169,106 @@ def get_selected_features(num_additions, features, tournament_probability):
     return selected_features
 
 
-def update_fitness(features, response, threshold, verbose):
-    basis = get_basis(features)
-    model = get_model(basis, response)
+def get_coefficient_fitness(coefs, mse_path, threshold, response_variance):
+    mse = np.mean(mse_path, axis=1)
+    r_squared = 1 - (mse / response_variance)
+    binary_coefs = coefs > threshold
+    return binary_coefs.dot(r_squared)
+
+
+def rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance, verbose):
+    fitness = get_coefficient_fitness(coefs, mse_path, threshold, response_variance)
+    for i, f in enumerate(features):
+        f.fitness = fitness[i]
+    new_features = list(filter(lambda x: x.original_variable is True, features))
+    possible_features = list(filter(lambda x: x.original_variable is False, features))
+    possible_features.sort(key=lambda x: x.fitness, reverse=True)
+    new_features.extend(possible_features[0:num_additions + 1])
+    new_features.sort(key=lambda x: x.fitness, reverse=True)
+    if verbose:
+        print('Top performing features:')
+        for i in range(5):
+            print(new_features[i].string)
+    return new_features
+
+
+def remove_zeroed_features(model, features, threshold, verbose):
     remove_features = []
     for i, coef in enumerate(model.coef_):
         fitness = math.fabs(coef)
         features[i].fitness = fitness
-        if fitness < threshold:
+        if features[i].fitness < threshold and not features[i].original_variable:
             remove_features.append(features[i])
     for f in remove_features:
         features.remove(f)
     if verbose and remove_features:
         print('Removed ' + str(len(remove_features)) + ' features from population.')
         print(get_model_string(remove_features))
+    return features
 
 
-def compose_features(num_additions, features, tournament_probability, verbose):
+def update_fitness(features, response, threshold, fitness_algorithm, response_variance, num_additions,
+                   time_series_cv, verbose):
+    basis = get_basis(features)
+    model, coefs, mse_path = get_model(basis, response, time_series_cv)
+    if fitness_algorithm == 'zero_out':
+        features = remove_zeroed_features(model, features, threshold, verbose)
+    elif fitness_algorithm == 'coefficient_rank':
+        features = rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance, verbose)
+    return features
+
+
+def uncorrelated(parents, new_feature, correlation_threshold):
+    correct = True
+    if type(parents) == list:
+        for p in parents:
+            r, _ = pearsonr(new_feature.value, p.value)
+            if r > correlation_threshold:
+                correct = False
+    else:
+        r, _ = pearsonr(new_feature.value, parents.value)
+        if r > correlation_threshold:
+            correct = False
+    return correct
+
+
+def compose_features(num_additions, features, tournament_probability, correlation_threshold,
+                     verbose, range_operators):
     selected_features = get_selected_features(num_additions, features, tournament_probability)
     new_feature_list = []
     for _ in range(num_additions):
         operator = random.choice(operators)
         if operator.parity == 1:
-            new_feature = random.choice(selected_features)
-            new_feature_string = operator.string.format(new_feature.string)
-            new_infix_string = operator.infix.format(new_feature.infix)
-            new_feature_value = operator.operation(new_feature.value)
-            new_feature_list.append(Feature(new_feature_value, new_feature_string, new_infix_string,
-                                            size=new_feature.size + 1))
+            parent = random.choice(selected_features)
+            new_feature_string = operator.string.format(parent.string)
+            new_infix_string = operator.infix.format(parent.infix_string)
+            new_feature_value = operator.operation(parent.value)
+            new_feature = Feature(new_feature_value, new_feature_string, new_infix_string,
+                                  size=parent.size + 1)
+            if uncorrelated(parent, new_feature, correlation_threshold):
+                new_feature_list.append(new_feature)
         elif operator.parity == 2:
-            new_features = random.choices(selected_features, k=2)
-            new_feature_string = operator.string.format(new_features[0].string, new_features[1].string)
-            new_infix_string = operator.infix.format(new_features[0].infix, new_features[1].infix)
-            new_feature_value = operator.operation(new_features[0].value, new_features[1].value)
-            new_feature_list.append(Feature(new_feature_value, new_feature_string, new_infix_string,
-                                            size=new_features[0].size + new_features[1].size + 1))
+            parents = random.choices(selected_features, k=2)
+            new_feature_string = operator.string.format(parents[0].string, parents[1].string)
+            new_infix_string = operator.infix.format(parents[0].infix_string, parents[1].infix_string)
+            new_feature_value = operator.operation(parents[0].value, parents[1].value)
+            new_feature = Feature(new_feature_value, new_feature_string, new_infix_string,
+                                  size=parents[0].size + parents[1].size + 1)
+            if uncorrelated(parents, new_feature, correlation_threshold):
+                new_feature_list.append(new_feature)
+        if range_operators:
+            protected_range_operators = list(filter(lambda x: type(x) == RangeOperation and x.original_variable,
+                                                    selected_features))
+            transitional_range_operators = list(filter(lambda x: type(x) == RangeOperation and not x.original_variable,
+                                                       selected_features))
+            if operator.infix_name == 'transition' and protected_range_operators:
+                parent = random.choice(protected_range_operators)
+                new_feature = deepcopy(parent)
+                new_feature.original_variable = False
+                new_feature_list.append(new_feature)
+            elif operator.infix_name == 'mutate' and transitional_range_operators:
+                parent = random.choice(transitional_range_operators)
+                parent.mutate_parameters()
     filtered_feature_list = list(filter(lambda x: x.size < 5, new_feature_list))
     features.extend(filtered_feature_list)
     if verbose:
@@ -200,11 +276,11 @@ def compose_features(num_additions, features, tournament_probability, verbose):
         print(get_model_string(new_feature_list))
 
 
-def score_model(features, response, verbose):
+def score_model(features, response, time_series_cv, verbose):
     if verbose:
         print('Scoring model with ' + str(len(features)) + ' features.')
     basis = get_basis(features)
-    model = get_model(basis, response)
+    model, _, _ = get_model(basis, response, time_series_cv)
     score = mean_squared_error(model.predict(basis), response)[0]
     return score, model
 
@@ -234,8 +310,7 @@ def build_operation_stack(string):
         if s == '(':
             substring = string[start:i]
             start = i + 1
-            operator = operators_map[substring]
-            stack.append(operator)
+            stack.append(substring)
         elif s == ',':
             if i != start:
                 substring = string[start:i]
@@ -249,49 +324,65 @@ def build_operation_stack(string):
     return stack
 
 
-def get_feature_value(stack, feature_names, predictors):
+def get_feature_value(stack, feature_names, predictors, variable_type_indices):
     variables_stack = []
-    while len(stack) > 1:
+    while len(stack) > 0:
         current = stack.pop()
-        if current in feature_names:
-            variables_stack.append(current)
+        if variable_type_indices and current.startswith('RangeOperation'):
+            range_operation = RangeOperation(variable_type_indices, feature_names, predictors, string=current)
+            variables_stack.append(np.squeeze(range_operation.value))
+        elif current in feature_names:
+            variable_index = feature_names.index(current)
+            variables_stack.append(predictors[:, variable_index])
         elif current in operators_map:
             operator = operators_map[current]
             variables = []
-            for _ in operator.parity:
+            for _ in range(operator.parity):
                 variables.append(variables_stack.pop())
-            # Double check this happens in the right order
-            result = operator.operation(variables_stack)
+            result = operator.operation(*variables)
             variables_stack.append(result)
+    return variables_stack.pop()
 
 
-def build_basis_from_features(features, feature_names, predictors):
-    basis = np.zeros((features[0].value.shape[0], len(features)))
-    for j, f in enumerate(features):
-        operation_stack = build_operation_stack(f.infix_string)
-        basis[:, j] = get_feature_value(operation_stack, feature_names, predictors)
-        return basis
+def build_basis_from_features(infix_features, feature_names, predictors, variable_type_indices):
+    basis = np.zeros((predictors.shape[0], len(infix_features)))
+    for j, f in enumerate(infix_features):
+        if variable_type_indices and f.startswith('RangeOperation'):
+            range_operation = RangeOperation(variable_type_indices, feature_names, predictors, string=f)
+            basis[:, j] = np.squeeze(range_operation.value)
+        elif f in feature_names:
+            variable_index = feature_names.index(f)
+            basis[:, j] = predictors[:, variable_index]
+        else:
+            operation_stack = build_operation_stack(f)
+            basis[:, j] = get_feature_value(operation_stack, feature_names, predictors, variable_type_indices)
+    return basis
 
 
-def build_model_from_data(features, feature_names, predictors, response):
-    basis = build_basis_from_features(features, feature_names, predictors)
-    model = get_model(basis, response)
+def get_basis_from_infix_features(infix_features, feature_names, predictors, variable_type_indices=None):
+    basis = build_basis_from_features(infix_features, feature_names, predictors, variable_type_indices)
+    basis = np.nan_to_num(basis)
+    return basis
 
 
-def optimize(predictors, response, max_gens, seed, num_additions=None, tournament_probability=.9,
-             max_useless_steps=10, fitness_threshold=.01, feature_names=None, verbose=False):
+def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_additions=None, preserve_originals=True,
+             tournament_probability=.9, max_useless_steps=10, fitness_threshold=.01, correlation_threshold=0.95,
+             reinit_range_operators=3, time_series_cv=False, feature_names=None, range_operators=None,
+             variable_type_indices=None, verbose=False):
     assert predictors.shape[1] == len(feature_names)
     num_additions, feature_names = init(num_additions, feature_names, predictors, seed)
+    features = init_features(feature_names, predictors, preserve_originals, range_operators,
+                             variable_type_indices)
     models = []
     statistics = Statistics()
     best_score = np.Inf
     steps_without_new_model = 0
-    features = init_features(feature_names, predictors)
+    response_variance = np.var(response)
     gen = 1
-    while gen < max_gens and steps_without_new_model < max_useless_steps:
+    while gen <= max_gens and steps_without_new_model < max_useless_steps:
         if verbose:
             print('Generation: ' + str(gen))
-        score, model = score_model(features, response, verbose)
+        score, model = score_model(features, response, time_series_cv, verbose)
         statistics.add(gen, score, len(features))
         print(get_model_string(features))
         print('Score: ' + str(score))
@@ -302,9 +393,151 @@ def optimize(predictors, response, max_gens, seed, num_additions=None, tournamen
             models.append(model)
         else:
             steps_without_new_model += 1
-        compose_features(num_additions, features, tournament_probability, verbose)
-        update_fitness(features, response, fitness_threshold, verbose)
+        if gen < max_gens:
+            compose_features(num_additions, features, tournament_probability, correlation_threshold, range_operators,
+                             verbose)
+            features = update_fitness(features, response, fitness_threshold, fitness_algorithm,
+                                      response_variance, num_additions, time_series_cv, verbose)
+            if gen % reinit_range_operators == 0:
+                features = swap_range_operators(features, range_operators, variable_type_indices, feature_names,
+                                                predictors)
         gen += 1
         if verbose:
             print('-------------------------------------------------------')
     return statistics, models, features
+
+
+def swap_range_operators(features, range_operations, variable_type_indices, feature_names, predictors):
+    for f in features:
+        if type(f) == RangeOperation and f.original_variable:
+            features.remove(f)
+    for _ in range(range_operations):
+        features.append(RangeOperation(variable_type_indices, feature_names, predictors))
+    return features
+
+
+def name_operation(operation, name):
+    operation.__name__ = name
+    return operation
+
+
+class RangeOperation(Feature):
+
+    def __init__(self, variable_type_indices, names, predictors, operation=None, begin_range_name=None,
+                 end_range_name=None, original_variable=True, string=None):
+        Feature.__init__(self, None, 'RangeOperation', 'RangeOperation', original_variable=original_variable)
+        self.predictors = predictors
+        self.begin_range = None
+        self.end_range = None
+        self.operation = None
+        self.names = None
+        self.lower_bound = None
+        self.upper_bound = None
+        self.variable_type_indices = variable_type_indices
+        self.operations = {
+            'sum': name_operation(np.sum, 'sum'),
+            'min': name_operation(np.min, 'min'),
+            'max': name_operation(np.max, 'max'),
+            'mean': name_operation(np.mean, 'mean'),
+            'vari': name_operation(np.var, 'vari'),
+            'skew': name_operation(skew, 'skew')
+        }
+        if string:
+            parts = string.split('_')
+            self.initialize_parameters(variable_type_indices, names, parts[1], parts[2], parts[3])
+        else:
+            self.initialize_parameters(variable_type_indices, names, operation, begin_range_name, end_range_name)
+        self.value = self.create_input_vector()
+        self.string = self.format()
+        self.infix_string = self.format()
+
+    def __deepcopy__(self, memo):
+        new = self.__class__(self.variable_type_indices, self.names, self.predictors)
+        new.__dict__.update(deepcopy(self.__dict__, memo))
+        return new
+
+    def initialize_parameters(self, variable_type_indices, names, operation=None, begin_range_name=None,
+                              end_range_name=None):
+        """
+        :param variable_type_indices: A sequence of variable type indices where each entry defines the
+        index of a variable type in the design matrix. For example a design matrix with two variable types will have
+        indices [j,n] where variable type A spans 0 to j and variable type B spans j + 1 to n.
+        :param names:
+        :param operation
+        :param begin_range_name
+        :param end_range_name
+        :return:
+        """
+        self.names = names
+        for r in variable_type_indices:
+            if r[1] - r[0] < 2:
+                raise ValueError('Invalid range provided to Range Terminal: ' + str(r))
+        rng = random.choice(variable_type_indices)
+        self.lower_bound = rng[0]
+        self.upper_bound = rng[1]
+        if operation is not None and begin_range_name is not None and end_range_name is not None:
+            if self.operations.get(operation) is None:
+                raise ValueError('Invalid operation provided to Range Terminal: ' + operation)
+            if begin_range_name not in self.names:
+                raise ValueError('Invalid range name provided to Range Termnial: ' + str(begin_range_name))
+            if end_range_name not in self.names:
+                raise ValueError('Invalid range name provided to Range Terminal: ' + str(end_range_name))
+            begin_range = self.names.index(begin_range_name)
+            end_range = self.names.index(end_range_name) + 1
+            valid = False
+            for r in variable_type_indices:
+                if r[0] <= begin_range < end_range <= r[1]:
+                    valid = True
+            if not valid:
+                raise ValueError('Invalid range provided to Range Terminal: (' + str(begin_range) + ',' +
+                                 str(end_range) + ')')
+            self.operation = self.operations[operation]
+            self.begin_range = begin_range
+            self.end_range = end_range
+        else:
+            self.operation = random.choice(list(self.operations.values()))
+            self.begin_range = np.random.randint(self.lower_bound, self.upper_bound - 1)
+            self.end_range = np.random.randint(self.begin_range + 1, self.upper_bound)
+
+    def mutate_parameters(self):
+        mutation = random.choice(['low', 'high'])
+        span = self.end_range - self.begin_range
+        if span == 0:
+            span = 1
+        value = random.gauss(0, math.sqrt(span))
+        amount = int(math.ceil(abs(value)))
+        if value < 0:
+            amount *= -1
+        if mutation == 'low':
+            location = amount + self.begin_range
+            if location < self.lower_bound:
+                self.begin_range = self.lower_bound
+            elif location > self.end_range - 2:
+                self.begin_range = self.end_range - 2
+            elif location > self.upper_bound - 2:
+                self.begin_range = self.upper_bound - 2
+            else:
+                self.begin_range = location
+        elif mutation == 'high':
+            location = amount + self.end_range
+            if location > self.upper_bound:
+                self.end_range = self.upper_bound
+            elif location < self.begin_range + 2:
+                self.end_range = self.begin_range + 2
+            elif location < self.lower_bound + 2:
+                self.end_range = self.lower_bound + 2
+            else:
+                self.end_range = location
+        self.value = self.create_input_vector()
+
+    def create_input_vector(self):
+        array = self.predictors[:, self.begin_range:self.end_range]
+        if array.shape[1] == 0:
+            return np.zeros((array.shape[0], 1))
+        else:
+            return self.operation(array, axis=1)
+
+    def format(self):
+        return "RangeOperation_{}_{}_{}".format(self.operation.__name__, self.names[self.begin_range],
+                                                self.names[self.end_range - 1])
+
