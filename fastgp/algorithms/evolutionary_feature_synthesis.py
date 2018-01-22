@@ -1,3 +1,4 @@
+import warnings
 import random
 from copy import deepcopy
 import math
@@ -147,8 +148,10 @@ def get_model(basis, response, time_series_cv):
     else:
         cv = KFold(n_splits=3)
     model = ElasticNetCV(l1_ratio=1, normalize=True, selection='random', cv=cv)
-    model.fit(basis, response)
-    _, coefs, _ = model.path(basis, response, l1_ration=model.l1_ratio_, alphas=model.alphas_)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        model.fit(basis, response)
+        _, coefs, _ = model.path(basis, response, l1_ration=model.l1_ratio_, alphas=model.alphas_)
     return model, coefs, model.mse_path_
 
 
@@ -164,8 +167,8 @@ def tournament_selection(population, probability):
 def get_selected_features(num_additions, features, tournament_probability):
     selected_features = []
     for _ in range(num_additions):
-        feature_index = tournament_selection(features, tournament_probability)
-        selected_features.append(feature_index)
+        feature = tournament_selection(features, tournament_probability)
+        selected_features.append(feature)
     return selected_features
 
 
@@ -268,12 +271,15 @@ def compose_features(num_additions, features, tournament_probability, correlatio
                 new_feature_list.append(new_feature)
             elif operator.infix_name == 'mutate' and transitional_range_operators:
                 parent = random.choice(transitional_range_operators)
-                parent.mutate_parameters()
+                new_feature = deepcopy(parent)
+                new_feature.mutate_parameters()
+                new_feature_list.append(new_feature)
     filtered_feature_list = list(filter(lambda x: x.size < 5, new_feature_list))
     features.extend(filtered_feature_list)
     if verbose:
         print('Adding ' + str(len(filtered_feature_list)) + ' features to population.')
         print(get_model_string(new_feature_list))
+    return features
 
 
 def score_model(features, response, time_series_cv, verbose):
@@ -351,10 +357,12 @@ def build_basis_from_features(infix_features, feature_names, predictors, variabl
             range_operation = RangeOperation(variable_type_indices, feature_names, predictors, string=f)
             basis[:, j] = np.squeeze(range_operation.value)
         elif f in feature_names:
+            # print('Getting value for: ' + str(f))
             variable_index = feature_names.index(f)
             basis[:, j] = predictors[:, variable_index]
         else:
             operation_stack = build_operation_stack(f)
+            # print('Processing operation stack: ' + str(operation_stack))
             basis[:, j] = get_feature_value(operation_stack, feature_names, predictors, variable_type_indices)
     return basis
 
@@ -374,12 +382,13 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
     features = init_features(feature_names, predictors, preserve_originals, range_operators,
                              variable_type_indices)
     models = []
+    infix_features = []
     statistics = Statistics()
     best_score = np.Inf
     steps_without_new_model = 0
     response_variance = np.var(response)
     gen = 1
-    while gen <= max_gens and steps_without_new_model < max_useless_steps:
+    while gen <= max_gens and steps_without_new_model <= max_useless_steps:
         if verbose:
             print('Generation: ' + str(gen))
         score, model = score_model(features, response, time_series_cv, verbose)
@@ -391,11 +400,12 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
             best_score = score
             print('New best model score: ' + str(best_score))
             models.append(model)
+            infix_features.append(list(map(lambda x: x.infix_string, features)))
         else:
             steps_without_new_model += 1
-        if gen < max_gens:
-            compose_features(num_additions, features, tournament_probability, correlation_threshold, range_operators,
-                             verbose)
+        if gen < max_gens or steps_without_new_model <= max_useless_steps:
+            features = compose_features(num_additions, features, tournament_probability, correlation_threshold,
+                                        range_operators, verbose)
             features = update_fitness(features, response, fitness_threshold, fitness_algorithm,
                                       response_variance, num_additions, time_series_cv, verbose)
             if gen % reinit_range_operators == 0:
@@ -404,7 +414,7 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
         gen += 1
         if verbose:
             print('-------------------------------------------------------')
-    return statistics, models, features
+    return statistics, models, infix_features
 
 
 def swap_range_operators(features, range_operations, variable_type_indices, feature_names, predictors):
@@ -500,6 +510,7 @@ class RangeOperation(Feature):
             self.end_range = np.random.randint(self.begin_range + 1, self.upper_bound)
 
     def mutate_parameters(self):
+        old = self.format()
         mutation = random.choice(['low', 'high'])
         span = self.end_range - self.begin_range
         if span == 0:
@@ -529,6 +540,9 @@ class RangeOperation(Feature):
             else:
                 self.end_range = location
         self.value = self.create_input_vector()
+        self.infix_string = self.format()
+        self.string = self.format()
+        print('Mutated ' + old + ' to ' + self.format())
 
     def create_input_vector(self):
         array = self.predictors[:, self.begin_range:self.end_range]
