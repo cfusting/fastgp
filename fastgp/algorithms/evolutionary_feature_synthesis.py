@@ -142,12 +142,12 @@ def get_basis(features):
     return basis
 
 
-def get_model(basis, response, time_series_cv):
+def get_model(basis, response, time_series_cv, seed):
     if time_series_cv:
         cv = TimeSeriesSplit(n_splits=3)
     else:
         cv = KFold(n_splits=3)
-    model = ElasticNetCV(l1_ratio=1, normalize=True, selection='random', cv=cv)
+    model = ElasticNetCV(l1_ratio=1, normalize=True, selection='random', cv=cv, random_state=seed)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         model.fit(basis, response)
@@ -188,10 +188,9 @@ def rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, res
     possible_features.sort(key=lambda x: x.fitness, reverse=True)
     new_features.extend(possible_features[0:num_additions + 1])
     new_features.sort(key=lambda x: x.fitness, reverse=True)
-    if verbose:
-        print('Top performing features:')
-        for i in range(5):
-            print(new_features[i].string)
+    print('Top performing features:')
+    for i in range(10):
+        print(new_features[i].string)
     return new_features
 
 
@@ -211,9 +210,9 @@ def remove_zeroed_features(model, features, threshold, verbose):
 
 
 def update_fitness(features, response, threshold, fitness_algorithm, response_variance, num_additions,
-                   time_series_cv, verbose):
+                   time_series_cv, seed, verbose):
     basis = get_basis(features)
-    model, coefs, mse_path = get_model(basis, response, time_series_cv)
+    model, coefs, mse_path = get_model(basis, response, time_series_cv, seed)
     if fitness_algorithm == 'zero_out':
         features = remove_zeroed_features(model, features, threshold, verbose)
     elif fitness_algorithm == 'coefficient_rank':
@@ -236,7 +235,7 @@ def uncorrelated(parents, new_feature, correlation_threshold):
 
 
 def compose_features(num_additions, features, tournament_probability, correlation_threshold,
-                     verbose, range_operators):
+                     range_operators, verbose):
     selected_features = get_selected_features(num_additions, features, tournament_probability)
     new_feature_list = []
     for _ in range(num_additions):
@@ -276,17 +275,16 @@ def compose_features(num_additions, features, tournament_probability, correlatio
                 new_feature_list.append(new_feature)
     filtered_feature_list = list(filter(lambda x: x.size < 5, new_feature_list))
     features.extend(filtered_feature_list)
+    print('Adding ' + str(len(filtered_feature_list)) + ' features to population.')
     if verbose:
-        print('Adding ' + str(len(filtered_feature_list)) + ' features to population.')
         print(get_model_string(new_feature_list))
     return features
 
 
-def score_model(features, response, time_series_cv, verbose):
-    if verbose:
-        print('Scoring model with ' + str(len(features)) + ' features.')
+def score_model(features, response, time_series_cv, seed):
+    print('Scoring model with ' + str(len(features)) + ' features.')
     basis = get_basis(features)
-    model, _, _ = get_model(basis, response, time_series_cv)
+    model, _, _ = get_model(basis, response, time_series_cv, seed)
     score = mean_squared_error(model.predict(basis), response)[0]
     return score, model
 
@@ -357,12 +355,10 @@ def build_basis_from_features(infix_features, feature_names, predictors, variabl
             range_operation = RangeOperation(variable_type_indices, feature_names, predictors, string=f)
             basis[:, j] = np.squeeze(range_operation.value)
         elif f in feature_names:
-            # print('Getting value for: ' + str(f))
             variable_index = feature_names.index(f)
             basis[:, j] = predictors[:, variable_index]
         else:
             operation_stack = build_operation_stack(f)
-            # print('Processing operation stack: ' + str(operation_stack))
             basis[:, j] = get_feature_value(operation_stack, feature_names, predictors, variable_type_indices)
     return basis
 
@@ -381,40 +377,40 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
     num_additions, feature_names = init(num_additions, feature_names, predictors, seed)
     features = init_features(feature_names, predictors, preserve_originals, range_operators,
                              variable_type_indices)
-    models = []
-    infix_features = []
+    best_models = []
+    best_features = []
     statistics = Statistics()
     best_score = np.Inf
     steps_without_new_model = 0
     response_variance = np.var(response)
     gen = 1
     while gen <= max_gens and steps_without_new_model <= max_useless_steps:
-        if verbose:
-            print('Generation: ' + str(gen))
-        score, model = score_model(features, response, time_series_cv, verbose)
+        print('Generation: ' + str(gen))
+        score, model = score_model(features, response, time_series_cv, seed)
         statistics.add(gen, score, len(features))
-        print(get_model_string(features))
+        if verbose:
+            print(get_model_string(features))
         print('Score: ' + str(score))
         if score < best_score:
             steps_without_new_model = 0
             best_score = score
             print('New best model score: ' + str(best_score))
-            models.append(model)
-            infix_features.append(list(map(lambda x: x.infix_string, features)))
+            best_models.append(model)
+            temp_features = deepcopy(features)
+            best_features.append(temp_features)
         else:
             steps_without_new_model += 1
-        if gen < max_gens or steps_without_new_model <= max_useless_steps:
+        print('-------------------------------------------------------')
+        if gen < max_gens and steps_without_new_model <= max_useless_steps:
             features = compose_features(num_additions, features, tournament_probability, correlation_threshold,
                                         range_operators, verbose)
             features = update_fitness(features, response, fitness_threshold, fitness_algorithm,
-                                      response_variance, num_additions, time_series_cv, verbose)
+                                      response_variance, num_additions, time_series_cv, seed, verbose)
             if gen % reinit_range_operators == 0:
                 features = swap_range_operators(features, range_operators, variable_type_indices, feature_names,
                                                 predictors)
         gen += 1
-        if verbose:
-            print('-------------------------------------------------------')
-    return statistics, models, infix_features
+    return statistics, best_models, best_features
 
 
 def swap_range_operators(features, range_operations, variable_type_indices, feature_names, predictors):
@@ -464,6 +460,8 @@ class RangeOperation(Feature):
     def __deepcopy__(self, memo):
         new = self.__class__(self.variable_type_indices, self.names, self.predictors)
         new.__dict__.update(deepcopy(self.__dict__, memo))
+        new.predictors = self.predictors
+        new.value = self.value
         return new
 
     def initialize_parameters(self, variable_type_indices, names, operation=None, begin_range_name=None,
