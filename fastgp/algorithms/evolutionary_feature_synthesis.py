@@ -7,6 +7,7 @@ import numpy as np
 
 from sklearn.linear_model import ElasticNetCV
 from sklearn.model_selection import TimeSeriesSplit, KFold
+from sklearn.preprocessing import StandardScaler
 
 from scipy.stats import pearsonr
 from scipy.stats import skew
@@ -139,7 +140,9 @@ def get_basis(features):
     for i, f in enumerate(features):
         basis[:, i] = features[i].value
     basis = np.nan_to_num(basis)
-    return basis
+    scaler = StandardScaler()
+    basis = scaler.fit_transform(basis)
+    return basis, scaler
 
 
 def get_model(basis, response, time_series_cv, seed):
@@ -147,12 +150,83 @@ def get_model(basis, response, time_series_cv, seed):
         cv = TimeSeriesSplit(n_splits=3)
     else:
         cv = KFold(n_splits=3)
-    model = ElasticNetCV(l1_ratio=1, normalize=True, selection='random', cv=cv, random_state=seed)
+    model = ElasticNetCV(l1_ratio=1, selection='random', cv=cv)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
         model.fit(basis, response)
         _, coefs, _ = model.path(basis, response, l1_ration=model.l1_ratio_, alphas=model.alphas_)
     return model, coefs, model.mse_path_
+
+
+def get_selected_features(num_additions, features, tournament_probability):
+    selected_features = []
+    for _ in range(num_additions):
+        feature = tournament_selection(features, tournament_probability)
+        selected_features.append(feature)
+    return selected_features
+
+
+def get_coefficient_fitness(coefs, mse_path, threshold, response_variance, response_mean):
+    mse = np.mean(mse_path, axis=1)
+    r_squared = 1 - (mse / response_variance)
+    binary_coefs = coefs > threshold
+    return binary_coefs.dot(r_squared)
+
+
+def rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance, response_mean,
+                        verbose):
+    fitness = get_coefficient_fitness(coefs, mse_path, threshold, response_variance, response_mean)
+    for i, f in enumerate(features):
+        f.fitness = fitness[i]
+    new_features = list(filter(lambda x: x.original_variable is True, features))
+    possible_features = list(filter(lambda x: x.original_variable is False, features))
+    possible_features.sort(key=lambda x: x.fitness, reverse=True)
+    new_features.extend(possible_features[0:num_additions + 1])
+    new_features.sort(key=lambda x: x.fitness, reverse=True)
+    print('Top performing features:')
+    for i in range(10):
+        print(new_features[i].string + ' - ' + str(new_features[i].fitness))
+    return new_features
+
+
+def remove_zeroed_features(model, features, threshold, verbose):
+    remove_features = []
+    for i, coef in enumerate(model.coef_):
+        features[i].fitness = math.fabs(coef)
+        if features[i].fitness <= threshold and not features[i].original_variable:
+            remove_features.append(features[i])
+    for f in remove_features:
+        features.remove(f)
+    print('Removed ' + str(len(remove_features)) + ' features from population.')
+    if verbose and remove_features:
+        print(get_model_string(remove_features))
+    return features
+
+
+def update_fitness(features, response, threshold, fitness_algorithm, response_variance, num_additions,
+                   time_series_cv, seed, response_mean, verbose):
+    basis, _ = get_basis(features)
+    model, coefs, mse_path = get_model(basis, response, time_series_cv, seed)
+    if fitness_algorithm == 'zero_out':
+        features = remove_zeroed_features(model, features, threshold, verbose)
+    elif fitness_algorithm == 'coefficient_rank':
+        features = rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance,
+                                       response_mean, verbose)
+    return features
+
+
+def uncorrelated(parents, new_feature, correlation_threshold):
+    uncorr = True
+    if type(parents) == list:
+        for p in parents:
+            r, _ = pearsonr(new_feature.value, p.value)
+            if r > correlation_threshold:
+                uncorr = False
+    else:
+        r, _ = pearsonr(new_feature.value, parents.value)
+        if r > correlation_threshold:
+            uncorr = False
+    return uncorr
 
 
 def tournament_selection(population, probability):
@@ -164,84 +238,13 @@ def tournament_selection(population, probability):
         return individuals[1]
 
 
-def get_selected_features(num_additions, features, tournament_probability):
-    selected_features = []
-    for _ in range(num_additions):
-        feature = tournament_selection(features, tournament_probability)
-        selected_features.append(feature)
-    return selected_features
-
-
-def get_coefficient_fitness(coefs, mse_path, threshold, response_variance):
-    mse = np.mean(mse_path, axis=1)
-    r_squared = 1 - (mse / response_variance)
-    binary_coefs = coefs > threshold
-    return binary_coefs.dot(r_squared)
-
-
-def rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance, verbose):
-    fitness = get_coefficient_fitness(coefs, mse_path, threshold, response_variance)
-    for i, f in enumerate(features):
-        f.fitness = fitness[i]
-    new_features = list(filter(lambda x: x.original_variable is True, features))
-    possible_features = list(filter(lambda x: x.original_variable is False, features))
-    possible_features.sort(key=lambda x: x.fitness, reverse=True)
-    new_features.extend(possible_features[0:num_additions + 1])
-    new_features.sort(key=lambda x: x.fitness, reverse=True)
-    print('Top performing features:')
-    for i in range(10):
-        print(new_features[i].string)
-    return new_features
-
-
-def remove_zeroed_features(model, features, threshold, verbose):
-    remove_features = []
-    for i, coef in enumerate(model.coef_):
-        fitness = math.fabs(coef)
-        features[i].fitness = fitness
-        if features[i].fitness < threshold and not features[i].original_variable:
-            remove_features.append(features[i])
-    for f in remove_features:
-        features.remove(f)
-    if verbose and remove_features:
-        print('Removed ' + str(len(remove_features)) + ' features from population.')
-        print(get_model_string(remove_features))
-    return features
-
-
-def update_fitness(features, response, threshold, fitness_algorithm, response_variance, num_additions,
-                   time_series_cv, seed, verbose):
-    basis = get_basis(features)
-    model, coefs, mse_path = get_model(basis, response, time_series_cv, seed)
-    if fitness_algorithm == 'zero_out':
-        features = remove_zeroed_features(model, features, threshold, verbose)
-    elif fitness_algorithm == 'coefficient_rank':
-        features = rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance, verbose)
-    return features
-
-
-def uncorrelated(parents, new_feature, correlation_threshold):
-    correct = True
-    if type(parents) == list:
-        for p in parents:
-            r, _ = pearsonr(new_feature.value, p.value)
-            if r > correlation_threshold:
-                correct = False
-    else:
-        r, _ = pearsonr(new_feature.value, parents.value)
-        if r > correlation_threshold:
-            correct = False
-    return correct
-
-
 def compose_features(num_additions, features, tournament_probability, correlation_threshold,
                      range_operators, verbose):
-    selected_features = get_selected_features(num_additions, features, tournament_probability)
     new_feature_list = []
     for _ in range(num_additions):
         operator = random.choice(operators)
         if operator.parity == 1:
-            parent = random.choice(selected_features)
+            parent = tournament_selection(features, tournament_probability)
             new_feature_string = operator.string.format(parent.string)
             new_infix_string = operator.infix.format(parent.infix_string)
             new_feature_value = operator.operation(parent.value)
@@ -250,19 +253,20 @@ def compose_features(num_additions, features, tournament_probability, correlatio
             if uncorrelated(parent, new_feature, correlation_threshold):
                 new_feature_list.append(new_feature)
         elif operator.parity == 2:
-            parents = random.choices(selected_features, k=2)
-            new_feature_string = operator.string.format(parents[0].string, parents[1].string)
-            new_infix_string = operator.infix.format(parents[0].infix_string, parents[1].infix_string)
-            new_feature_value = operator.operation(parents[0].value, parents[1].value)
+            parent1 = tournament_selection(features, tournament_probability)
+            parent2 = tournament_selection(features, tournament_probability)
+            new_feature_string = operator.string.format(parent1.string, parent2.string)
+            new_infix_string = operator.infix.format(parent1.infix_string, parent2.infix_string)
+            new_feature_value = operator.operation(parent1.value, parent2.value)
             new_feature = Feature(new_feature_value, new_feature_string, new_infix_string,
-                                  size=parents[0].size + parents[1].size + 1)
-            if uncorrelated(parents, new_feature, correlation_threshold):
+                                  size=parent1.size + parent2.size + 1)
+            if uncorrelated([parent1, parent2], new_feature, correlation_threshold):
                 new_feature_list.append(new_feature)
         if range_operators:
             protected_range_operators = list(filter(lambda x: type(x) == RangeOperation and x.original_variable,
-                                                    selected_features))
+                                                    features))
             transitional_range_operators = list(filter(lambda x: type(x) == RangeOperation and not x.original_variable,
-                                                       selected_features))
+                                                       features))
             if operator.infix_name == 'transition' and protected_range_operators:
                 parent = random.choice(protected_range_operators)
                 new_feature = deepcopy(parent)
@@ -283,10 +287,10 @@ def compose_features(num_additions, features, tournament_probability, correlatio
 
 def score_model(features, response, time_series_cv, seed):
     print('Scoring model with ' + str(len(features)) + ' features.')
-    basis = get_basis(features)
+    basis, scaler = get_basis(features)
     model, _, _ = get_model(basis, response, time_series_cv, seed)
     score = mean_squared_error(model.predict(basis), response)[0]
-    return score, model
+    return score, model, scaler
 
 
 def get_model_string(features):
@@ -371,7 +375,7 @@ def get_basis_from_infix_features(infix_features, feature_names, predictors, var
 
 def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_additions=None, preserve_originals=True,
              tournament_probability=.9, max_useless_steps=10, fitness_threshold=.01, correlation_threshold=0.95,
-             reinit_range_operators=3, time_series_cv=False, feature_names=None, range_operators=None,
+             reinit_range_operators=3, time_series_cv=False, feature_names=None, range_operators=0,
              variable_type_indices=None, verbose=False):
     assert predictors.shape[1] == len(feature_names)
     num_additions, feature_names = init(num_additions, feature_names, predictors, seed)
@@ -379,14 +383,16 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
                              variable_type_indices)
     best_models = []
     best_features = []
+    best_scalers = []
     statistics = Statistics()
     best_score = np.Inf
     steps_without_new_model = 0
     response_variance = np.var(response)
+    response_mean = np.mean(response)
     gen = 1
     while gen <= max_gens and steps_without_new_model <= max_useless_steps:
         print('Generation: ' + str(gen))
-        score, model = score_model(features, response, time_series_cv, seed)
+        score, model, scaler = score_model(features, response, time_series_cv, seed)
         statistics.add(gen, score, len(features))
         if verbose:
             print(get_model_string(features))
@@ -397,7 +403,10 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
             print('New best model score: ' + str(best_score))
             best_models.append(model)
             temp_features = deepcopy(features)
+            for f in temp_features:
+                f.value = None
             best_features.append(temp_features)
+            best_scalers.append(scaler)
         else:
             steps_without_new_model += 1
         print('-------------------------------------------------------')
@@ -405,12 +414,13 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
             features = compose_features(num_additions, features, tournament_probability, correlation_threshold,
                                         range_operators, verbose)
             features = update_fitness(features, response, fitness_threshold, fitness_algorithm,
-                                      response_variance, num_additions, time_series_cv, seed, verbose)
+                                      response_variance, num_additions, time_series_cv, seed, response_mean,
+                                      verbose)
             if gen % reinit_range_operators == 0:
                 features = swap_range_operators(features, range_operators, variable_type_indices, feature_names,
                                                 predictors)
         gen += 1
-    return statistics, best_models, best_features
+    return statistics, best_models, best_features, best_scalers
 
 
 def swap_range_operators(features, range_operations, variable_type_indices, feature_names, predictors):
