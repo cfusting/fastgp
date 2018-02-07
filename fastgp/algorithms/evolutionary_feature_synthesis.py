@@ -145,11 +145,11 @@ def get_basis(features):
     return basis, scaler
 
 
-def get_model(basis, response, time_series_cv, seed):
+def get_model(basis, response, time_series_cv, splits):
     if time_series_cv:
-        cv = TimeSeriesSplit(n_splits=3)
+        cv = TimeSeriesSplit(n_splits=splits)
     else:
-        cv = KFold(n_splits=3)
+        cv = KFold(n_splits=splits)
     model = ElasticNetCV(l1_ratio=1, selection='random', cv=cv)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
@@ -166,16 +166,16 @@ def get_selected_features(num_additions, features, tournament_probability):
     return selected_features
 
 
-def get_coefficient_fitness(coefs, mse_path, threshold, response_variance, response_mean):
+def get_coefficient_fitness(coefs, mse_path, threshold, response_variance):
     mse = np.mean(mse_path, axis=1)
     r_squared = 1 - (mse / response_variance)
     binary_coefs = coefs > threshold
     return binary_coefs.dot(r_squared)
 
 
-def rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance, response_mean,
+def rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance,
                         verbose):
-    fitness = get_coefficient_fitness(coefs, mse_path, threshold, response_variance, response_mean)
+    fitness = get_coefficient_fitness(coefs, mse_path, threshold, response_variance)
     for i, f in enumerate(features):
         f.fitness = fitness[i]
     new_features = list(filter(lambda x: x.original_variable is True, features))
@@ -204,14 +204,14 @@ def remove_zeroed_features(model, features, threshold, verbose):
 
 
 def update_fitness(features, response, threshold, fitness_algorithm, response_variance, num_additions,
-                   time_series_cv, seed, response_mean, verbose):
+                   time_series_cv, splits, verbose):
     basis, _ = get_basis(features)
-    model, coefs, mse_path = get_model(basis, response, time_series_cv, seed)
+    model, coefs, mse_path = get_model(basis, response, time_series_cv, splits)
     if fitness_algorithm == 'zero_out':
         features = remove_zeroed_features(model, features, threshold, verbose)
     elif fitness_algorithm == 'coefficient_rank':
         features = rank_by_coefficient(features, coefs, mse_path, num_additions, threshold, response_variance,
-                                       response_mean, verbose)
+                                       verbose)
     return features
 
 
@@ -285,10 +285,10 @@ def compose_features(num_additions, features, tournament_probability, correlatio
     return features
 
 
-def score_model(features, response, time_series_cv, seed):
+def score_model(features, response, time_series_cv, splits):
     print('Scoring model with ' + str(len(features)) + ' features.')
     basis, scaler = get_basis(features)
-    model, _, _ = get_model(basis, response, time_series_cv, seed)
+    model, _, _ = get_model(basis, response, time_series_cv, splits)
     score = mean_squared_error(model.predict(basis), response)[0]
     return score, model, scaler
 
@@ -367,15 +367,18 @@ def build_basis_from_features(infix_features, feature_names, predictors, variabl
     return basis
 
 
-def get_basis_from_infix_features(infix_features, feature_names, predictors, variable_type_indices=None):
+def get_basis_from_infix_features(infix_features, feature_names, predictors, scaler=None,
+                                  variable_type_indices=None):
     basis = build_basis_from_features(infix_features, feature_names, predictors, variable_type_indices)
     basis = np.nan_to_num(basis)
+    if scaler:
+        basis = scaler.transform(basis)
     return basis
 
 
 def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_additions=None, preserve_originals=True,
              tournament_probability=.9, max_useless_steps=10, fitness_threshold=.01, correlation_threshold=0.95,
-             reinit_range_operators=3, time_series_cv=False, feature_names=None, range_operators=0,
+             reinit_range_operators=3, splits=3, time_series_cv=False, feature_names=None, range_operators=0,
              variable_type_indices=None, verbose=False):
     assert predictors.shape[1] == len(feature_names)
     num_additions, feature_names = init(num_additions, feature_names, predictors, seed)
@@ -384,20 +387,21 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
     best_models = []
     best_features = []
     best_scalers = []
+    best_validation_scores = []
     statistics = Statistics()
     best_score = np.Inf
     steps_without_new_model = 0
     response_variance = np.var(response)
-    response_mean = np.mean(response)
     gen = 1
     while gen <= max_gens and steps_without_new_model <= max_useless_steps:
         print('Generation: ' + str(gen))
-        score, model, scaler = score_model(features, response, time_series_cv, seed)
+        score, model, scaler = score_model(features, response, time_series_cv, splits)
         statistics.add(gen, score, len(features))
         if verbose:
             print(get_model_string(features))
         print('Score: ' + str(score))
         if score < best_score:
+            best_validation_scores.append(score)
             steps_without_new_model = 0
             best_score = score
             print('New best model score: ' + str(best_score))
@@ -414,13 +418,13 @@ def optimize(predictors, response, seed, fitness_algorithm, max_gens=100, num_ad
             features = compose_features(num_additions, features, tournament_probability, correlation_threshold,
                                         range_operators, verbose)
             features = update_fitness(features, response, fitness_threshold, fitness_algorithm,
-                                      response_variance, num_additions, time_series_cv, seed, response_mean,
+                                      response_variance, num_additions, time_series_cv, splits,
                                       verbose)
             if gen % reinit_range_operators == 0:
                 features = swap_range_operators(features, range_operators, variable_type_indices, feature_names,
                                                 predictors)
         gen += 1
-    return statistics, best_models, best_features, best_scalers
+    return statistics, best_models, best_features, best_scalers, best_validation_scores
 
 
 def swap_range_operators(features, range_operations, variable_type_indices, feature_names, predictors):
@@ -489,7 +493,7 @@ class RangeOperation(Feature):
         self.names = names
         for r in variable_type_indices:
             if r[1] - r[0] < 2:
-                raise ValueError('Invalid range provided to Range Terminal: ' + str(r))
+                raise ValueError('Invalid variable type indices: ' + str(r))
         rng = random.choice(variable_type_indices)
         self.lower_bound = rng[0]
         self.upper_bound = rng[1]
@@ -550,7 +554,7 @@ class RangeOperation(Feature):
         self.value = self.create_input_vector()
         self.infix_string = self.format()
         self.string = self.format()
-        print('Mutated ' + old + ' to ' + self.format())
+        # print('Mutated ' + old + ' to ' + self.format())
 
     def create_input_vector(self):
         array = self.predictors[:, self.begin_range:self.end_range]
