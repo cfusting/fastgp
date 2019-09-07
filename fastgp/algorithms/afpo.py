@@ -56,12 +56,13 @@ def find_pareto_front(population):
 def reduce_population(population, tournament_size, target_popsize, nondominated_size):
     num_iterations = 0
     new_population_indices = list(range(len(population)))
+    stop_cond = False
     while len(new_population_indices) > target_popsize and len(new_population_indices) > nondominated_size:
         if num_iterations > 10e6:
             print("Pareto front size may be exceeding the size of population. Stopping the execution. Try making"
                   "the population size larger or the number of generations smaller.")
             # random.sample(new_population_indices, len(new_population_indices) - target_popsize)
-            exit()
+            stop_cond = True
         num_iterations += 1
         tournament_indices = random.sample(new_population_indices, tournament_size)
         tournament = [population[index] for index in tournament_indices]
@@ -70,10 +71,14 @@ def reduce_population(population, tournament_size, target_popsize, nondominated_
             if i not in nondominated_tournament:
                 new_population_indices.remove(tournament_indices[i])
     population[:] = [population[i] for i in new_population_indices]
+    return stop_cond
 
 
-def pareto_optimization(population, toolbox, xover_prob, mut_prob, ngen, tournament_size, num_randoms=1, archive=None,
-                        stats=None, calc_pareto_front=True, verbose=False, reevaluate_population=False, history=None):
+def pareto_optimization(population, toolbox, xover_prob, mut_prob, ngen,
+                        tournament_size, num_randoms=1, archive=None,
+                        stats=None, calc_pareto_front=True, verbose=False,
+                        reevaluate_population=False, history=None,
+                        stop_time=None):
     start = time.time()
     if history is not None:
         history.update(population)
@@ -90,13 +95,15 @@ def pareto_optimization(population, toolbox, xover_prob, mut_prob, ngen, tournam
         history.genealogy_history[ind.history_index].error = ind.error
 
     record = stats.compile(population) if stats else {}
-    logbook.record(gen=0, nevals=len(population), cpu_time=time.time() - start, **record)
+    cpu_time = time.time() - start
+    logbook.record(gen=0, nevals=len(population), cpu_time=cpu_time, **record)
     if archive is not None:
         archive.update(population)
     if verbose:
         print(logbook.stream)
 
-    for gen in range(1, ngen + 1):
+    gen = 0
+    while(gen < (ngen + 1)):
         # do we want to enforce re-evaluating the whole population instead of using cached erro r values
         if reevaluate_population:
             for ind in population:
@@ -132,10 +139,14 @@ def pareto_optimization(population, toolbox, xover_prob, mut_prob, ngen, tournam
             pareto_front_size = 0
 
         # perform Pareto tournament selection until the size of the population is reduced to target_popsize
-        reduce_population(population, tournament_size, target_popsize, pareto_front_size)
+        stop_cond = reduce_population(population, tournament_size, target_popsize, pareto_front_size)
 
         record = stats.compile(population) if stats else {}
-        logbook.record(gen=gen, nevals=len(population), cpu_time=time.time() - start, **record)
+        cpu_time = time.time() - start
+
+        print(gen, cpu_time, stop_time)
+
+        logbook.record(gen=gen, nevals=len(population), cpu_time=cpu_time, **record)
         if archive is not None:
             archive.update(population)
         if verbose:
@@ -143,6 +154,15 @@ def pareto_optimization(population, toolbox, xover_prob, mut_prob, ngen, tournam
 
         for ind in population:
             ind.age += 1
+
+        if stop_cond:
+            print('Stop condition reached at generation %i.' % gen)
+            gen = ngen + 1
+        elif stop_time is not None and cpu_time > stop_time:
+            print('Stop time reached at generation %i.' % gen)
+            gen = ngen + 1
+        else:
+            gen = gen + 1
 
     return population, logbook, history
 
